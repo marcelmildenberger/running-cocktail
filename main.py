@@ -5,8 +5,7 @@ Planer für 'Running Cocktail' Mannheim
 
 Funktionen:
 - CSV einlesen (deutsche Spaltennamen)
-- Geokodierung (OSM/Nominatim)
-- Entfernung zum Mannheimer Schloss berechnen
+- Entfernungen via Google Maps Distance Matrix (kein Geocoding, nur Adressen)
 - Gruppen in 3 Ringe (außen/mittel/innen) einteilen
 - 3 Runden mit Stations-Trios (Host + 2 Gäste) planen:
     * jede Gruppe hostet genau 1x
@@ -18,27 +17,21 @@ Funktionen:
 Aufruf:
     python main.py RuCo.csv resultcle
 
-Benötigte Pakete: pandas, numpy, geopy, (optional) openpyxl
+Benötigte Pakete: pandas, numpy, requests, (optional) openpyxl
 """
 
 import os
 import sys
-import math
 import random
 import argparse
 import itertools
-from collections import defaultdict, Counter
+from collections import defaultdict
 
 import pandas as pd
 import numpy as np
-
-# Optionale Geokodierer
-try:
-    from geopy.geocoders import Nominatim
-    from geopy.extra.rate_limiter import RateLimiter
-except Exception:
-    Nominatim = None
-    RateLimiter = None
+import requests
+import json
+import re
 
 
 # ----------------------------
@@ -60,8 +53,7 @@ COL_STADTTEIL = "neighbourhood"
 COL_STADT = "city"
 
 # Schloss Mannheim – wird (best effort) geokodiert; falls offline: Fallback-Koordinaten
-SCHLOSS_QUERY = "Mannheimer Schloss, 68161 Mannheim, Deutschland"
-SCHLOSS_FALLBACK = (49.4837, 8.4620)  # robuste Näherung
+SCHLOSS_QUERY = "Mannheimer Schloss, 68161 Mannheim, Germany"
 
 # Standard: je Station 2 Gäste (Host + 2 Gäste = 3 Gruppen)
 DEFAULT_GUESTS_PER_HOST = 2
@@ -84,47 +76,53 @@ def normalize_fachschaft(s: str) -> str:
 
 
 def build_full_address(row) -> str:
-    parts = []
-    for col in [COL_STREET, COL_PLZ, COL_STADTTEIL, COL_STADT]:
-        val = row.get(col)
-        if isinstance(val, str) and val.strip():
-            parts.append(val.strip())
-    # Sicherheitshalber 'Mannheim' anhängen, falls nicht vorhanden
-    addr = ", ".join(parts)
-    if "mannheim" not in addr.lower():
-        addr = addr + ", Mannheim"
-    return addr
+    """Baut eine Adresse für Google Routes: "Straße Hausnr, PLZ Stadt, Germany".
+    Wichtige Regeln:
+      - **neighbourhood wird NICHT eingefügt** (führt häufig zu NO_ELEMENT bei RouteMatrix)
+      - Mannheimer Quadrate wie "F4, 16" / "F 4, 16" -> "F4 16"
+      - Falls im Straßenfeld Kommas vorkommen (z.B. "Steubenstraße 80, 304"), wird nur der **erste** Teil verwendet
+      - ß -> ss als Fallback
+    """
+    def _norm_quadrate(s: str) -> str:
+        if not isinstance(s, str):
+            return ""
+        s = " ".join(s.strip().split())
+        # Nur ersten Teil vor einem Komma nehmen (Apartment/Suite entfernen)
+        if "," in s:
+            s = s.split(",", 1)[0].strip()
+        # Muster: "F4, 16" / "F 4, 16" / "F4,16" -> "F4 16"
+        s = re.sub(r"^([A-Za-z])\s*([0-9]+)\s*,\s*([0-9]+)(\b|$)", r"\1\2 \3", s)
+        # Muster: "F 4 16" -> "F4 16"
+        s = re.sub(r"^([A-Za-z])\s+([0-9]+)\s+([0-9]+)(\b|$)", r"\1\2 \3", s)
+        # Fallback: ß -> ss, verbessert teils die Trefferquote
+        s = s.replace("ß", "ss")
+        return s
+
+    street_raw = (row.get(COL_STREET) or "").strip()
+    street = _norm_quadrate(street_raw)
+
+    plz = (row.get(COL_PLZ) or "").strip()
+    city = (row.get(COL_STADT) or "").strip() or "Mannheim"
+    city = city.replace("ß", "ss")
+
+    # Keine Verwendung von neighbourhood (COL_STADTTEIL) — explizit weglassen!
+
+    # Rechte Seite (PLZ Stadt) sauber bauen
+    right = f"{plz} {city}".strip()
+    right = " ".join(right.split())
+
+    if street and right:
+        addr = f"{street}, {right}, Germany"
+    elif street:
+        addr = f"{street}, Mannheim, Germany"
+    elif right:
+        addr = f"{right}, Germany"
+    else:
+        addr = "Mannheim, Germany"
+
+    return " ".join(addr.split())
 
 
-def haversine_m(lat1, lon1, lat2, lon2) -> float:
-    # Meter
-    R = 6371000.0
-    p1 = math.radians(lat1)
-    p2 = math.radians(lat2)
-    dp = math.radians(lat2 - lat1)
-    dl = math.radians(lon2 - lon1)
-    a = math.sin(dp/2)**2 + math.cos(p1)*math.cos(p2)*math.sin(dl/2)**2
-    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
-    return R * c
-
-
-def geocode_one(address: str, osm_geocoder=None):
-    # OSM/Nominatim
-    if osm_geocoder:
-        try:
-            loc = osm_geocoder.geocode(address)
-            if loc:
-                return loc.latitude, loc.longitude
-        except Exception:
-            pass
-    return None, None
-
-
-def geocode_center(osm_geocoder=None):
-    lat, lng = geocode_one(SCHLOSS_QUERY, osm_geocoder)
-    if lat is None:
-        lat, lng = SCHLOSS_FALLBACK
-    return lat, lng
 
 
 def split_into_three_bands_by_distance(df: pd.DataFrame, dist_col: str, seed: int):
@@ -134,7 +132,8 @@ def split_into_three_bands_by_distance(df: pd.DataFrame, dist_col: str, seed: in
     Sortiert nach Distanz absteigend (außen zuerst).
     Gibt dict: group_id -> host_round (1=außen, 2=mittel, 3=innen)
     """
-    rng = random.Random(seed)
+    # Sortiert nach Distanz absteigend (außen zuerst) und NICHT mischen,
+    # damit Runde 1 wirklich außen, Runde 2 mittel, Runde 3 innen ist.
     df_sorted = df.sort_values(dist_col, ascending=False).copy()
     n = len(df_sorted)
     base = n // 3
@@ -142,8 +141,6 @@ def split_into_three_bands_by_distance(df: pd.DataFrame, dist_col: str, seed: in
     sizes = [base + (1 if i < rem else 0) for i in range(3)]  # Summe = n, so balanciert wie möglich
 
     idxs = list(df_sorted.index)
-    # Um gleich entfernte besser zu verteilen, leicht mischen (stabil genug)
-    rng.shuffle(idxs)
 
     bands = {}
     start = 0
@@ -172,15 +169,17 @@ def compute_host_capacities(num_hosts: int, num_available_guests: int, default_p
     return caps
 
 
-def schedule_round(host_ids, guest_ids, groups, round_no, rng, encounters, fach_counts):
+def schedule_round(host_ids, guest_ids, groups, round_no, rng, encounters, prev_locations, addr_dist_map, center_addr):
     """
     Weist jedem Host eine Anzahl Gäste (1..3) zu, so dass:
       - Jeder Gast genau 1x in dieser Runde zugeteilt wird.
       - Wiederholte Begegnungen vermieden werden.
-      - Fachschaften gemischt bevorzugt werden.
-    'groups' ist ein Dict group_id -> dict mit 'Fach', 'Name', 'lat','lng','dist','addr', etc.
+      - Strecken möglichst kurz bleiben (kontinuierliche Wege zwischen Runden).
+    'groups' ist ein Dict group_id -> dict mit 'Fach', 'Name', 'Adresse', etc.
     encounters[group_id] = set(bisher getroffene Gruppen)
-    fach_counts[group_id] = Counter({"FIM":x,"VWL":y}) der bisher getroffenen Gegenüber
+    prev_locations[group_id] = Adresse (letzter Standort nach voriger Runde)
+    addr_dist_map: dict[Adresse][Adresse] = Distanz in Meter (int|None)
+    center_addr: Adresse des Zentrums (Schloss)
     """
     rng.shuffle(host_ids)
     rng.shuffle(guest_ids)
@@ -193,33 +192,26 @@ def schedule_round(host_ids, guest_ids, groups, round_no, rng, encounters, fach_
 
     def pair_score(h, g, co_guests):
         # Höhere Punkte = besser
+        # Vermeide Wiederholungs-Begegnungen hart, minimiere Laufweg weich.
+        # Zusätzlich in Runde 3 leichte Bevorzugung von Hosts näher am Schloss.
         score = 0.0
-        # Nicht doppelt begegnen
         if g in encounters[h]:
-            score -= 100.0
-        # Fachschaften mischen
-        if groups[h]["Fach"] != groups[g]["Fach"]:
-            score += 5.0
-        else:
-            score -= 1.0
-        # Gäste untereinander: lieber neue Begegnungen & gemischte Fachschaften
-        for cg in co_guests:
-            if g in encounters[cg]:
-                score -= 30.0
-            if groups[cg]["Fach"] != groups[g]["Fach"]:
-                score += 2.0
-            else:
-                score -= 0.5
-        # Ausgewogenheit für den Gast selbst (nicht 3x dieselbe Fachschaft treffen)
-        fc = fach_counts[g]
-        # angenommen: er trifft jetzt Host h und die co_guests
-        projected_same = fc[groups[h]["Fach"]] + sum(1 for cg in co_guests if groups[cg]["Fach"] == groups[h]["Fach"])
-        projected_other = sum(fc.values()) - fc[groups[h]["Fach"]] + sum(1 for cg in co_guests if groups[cg]["Fach"] != groups[h]["Fach"])
-        # leichte Präferenz für Ausgleich
-        if projected_same > projected_other + 1:
-            score -= 2.0
-        # leichte Zufallskomponente zur Diversifizierung
-        score += rng.random() * 0.01
+            return -1e6
+
+        prev_addr = prev_locations.get(g, groups[g]["Adresse"])
+        host_addr = groups[h]["Adresse"]
+        d = addr_dist_map.get(prev_addr, {}).get(host_addr)
+        if d is None:
+            d = 1e6
+        score -= d / 1000.0  # in km gewichten
+
+        if round_no == 3:
+            d_center = addr_dist_map.get(host_addr, {}).get(center_addr)
+            if d_center is None:
+                d_center = 1e6
+            score -= 0.3 * (d_center / 1000.0)
+
+        score += rng.random() * 1e-3
         return score
 
     # Zuteilung pro Host
@@ -249,13 +241,9 @@ def schedule_round(host_ids, guest_ids, groups, round_no, rng, encounters, fach_
             for g in chosen:
                 encounters[host].add(g)
                 encounters[g].add(host)
-                fach_counts[host][groups[g]["Fach"]] += 1
-                fach_counts[g][groups[host]["Fach"]] += 1
             for a, b in itertools.combinations(chosen, 2):
                 encounters[a].add(b)
                 encounters[b].add(a)
-                fach_counts[a][groups[b]["Fach"]] += 1
-                fach_counts[b][groups[a]["Fach"]] += 1
 
     # Falls aus irgendeinem Grund noch Gäste übrig sind (sollte nicht passieren, aber safety net):
     if guest_pool:
@@ -268,17 +256,198 @@ def schedule_round(host_ids, guest_ids, groups, round_no, rng, encounters, fach_
                 # Begegnungen nachtragen
                 h = pack["host"]
                 encounters[h].add(g); encounters[g].add(h)
-                fach_counts[h][groups[g]["Fach"]] += 1
-                fach_counts[g][groups[h]["Fach"]] += 1
                 for cg in pack["guests"]:
                     if cg == g:
                         continue
                     encounters[cg].add(g); encounters[g].add(cg)
-                    fach_counts[cg][groups[g]["Fach"]] += 1
-                    fach_counts[g][groups[cg]["Fach"]] += 1
                 break
 
     return assignments
+
+
+
+# --- Google Routes API helper ---
+
+def get_routes_api_key():
+    """
+    Bezieht den API-Key bevorzugt aus der Umgebung (GOOGLE_MAPS_API_KEY oder GOOGLE_ROUTES_API_KEY).
+    Fällt – nur falls vorhanden – auf den im Code hinterlegten Key zurück.
+    """
+    for var_name in ("GOOGLE_ROUTES_API_KEY", "GOOGLE_MAPS_API_KEY", "GOOGLE_MAPS_DISTANCE_MATRIX_API_KEY"):
+        candidate = os.environ.get(var_name)
+        if candidate and candidate.strip():
+            return candidate.strip()
+
+    # Historischer Fallback-Key (z.B. für lokale Tests). Bitte durch eigenen Key ersetzen.
+    fallback_key = ""
+    if fallback_key:
+        return fallback_key
+
+    raise RuntimeError("Kein Google Routes API Key gefunden. Setze z.B. GOOGLE_ROUTES_API_KEY in deiner Umgebung.")
+
+
+
+def _chunk(lst, n):
+    for i in range(0, len(lst), n):
+        yield lst[i:i+n]
+
+ROUTES_DM_URL = "https://routes.googleapis.com/distanceMatrix/v2:computeRouteMatrix"
+
+_MODE_MAP = {
+    "walking": "WALK",
+    "driving": "DRIVE",
+    "bicycling": "BICYCLE",
+    "bicycle": "BICYCLE",
+    "transit": "TRANSIT",
+}
+
+def _parse_route_matrix_response(text, origins, destinations):
+    """Parst die JSON-Lines Antwort der Routes API und liefert zwei Maps:
+    - dist_out[origin][destination] = distanceMeters | None
+    - status_out[origin][destination] = {"code": int|str, "message": str}
+      Für fehlende Elemente wird ein Dummy-Status gesetzt.
+    """
+    def _collect_entries(obj, bucket):
+        if isinstance(obj, dict):
+            if "originIndex" in obj and "destinationIndex" in obj:
+                bucket.append(obj)
+            else:
+                for val in obj.values():
+                    _collect_entries(val, bucket)
+        elif isinstance(obj, list):
+            for item in obj:
+                _collect_entries(item, bucket)
+
+    raw = (text or "")
+    elements = []
+    for line in raw.strip().splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped.startswith("data:"):
+            stripped = stripped[5:].strip()
+        try:
+            candidate = json.loads(stripped)
+        except Exception:
+            continue
+        _collect_entries(candidate, elements)
+
+    if not elements:
+        # Fallback: einige Responses kommen als JSON-Objekt statt JSON-Lines
+        try:
+            payload = json.loads(raw)
+        except Exception:
+            payload = None
+        if payload is not None:
+            _collect_entries(payload, elements)
+
+    result = {}
+    status_map_idx = {}
+    for el in elements:
+        if not isinstance(el, dict):
+            continue
+        oi = el.get("originIndex")
+        di = el.get("destinationIndex")
+        if oi is None or di is None:
+            continue
+        status_obj = el.get("status") or {}
+        status_code = status_obj.get("code", 0)
+        status_map_idx.setdefault(oi, {})[di] = {
+            "code": status_code,
+            "message": status_obj.get("message", "")
+        }
+        dist = el.get("distanceMeters") if status_code == 0 else None
+        result.setdefault(oi, {})[di] = dist
+
+    # In adressbasierte Maps umwandeln
+    dist_out = {o: {} for o in origins}
+    status_out = {o: {} for o in origins}
+    for oi in range(len(origins)):
+        for di in range(len(destinations)):
+            dist = None
+            status_obj = status_map_idx.get(oi, {}).get(di)
+            if status_obj is None:
+                # Element fehlte komplett in der Antwort
+                status_obj = {"code": "NO_ELEMENT", "message": "Pair missing in response"}
+            else:
+                dist = result.get(oi, {}).get(di)
+            dist_out[origins[oi]][destinations[di]] = dist
+            status_out[origins[oi]][destinations[di]] = status_obj
+    return dist_out, status_out
+
+
+def _gm_distance_matrix_chunk_routes(api_key, origins, destinations, mode="walking"):
+    out, _status = _gm_distance_matrix_chunk_routes_with_status(api_key, origins, destinations, mode=mode)
+    return out
+
+
+def _gm_distance_matrix_chunk_routes_with_status(api_key, origins, destinations, mode="walking"):
+    travel_mode = _MODE_MAP.get((mode or "walking").lower(), "WALK")
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "X-Goog-Api-Key": api_key,
+        # FieldMask ist Pflicht, sonst 400
+        "X-Goog-FieldMask": "originIndex,destinationIndex,distanceMeters,duration,status",
+    }
+    body = {
+        "origins": [{"waypoint": {"address": o}} for o in origins],
+        "destinations": [{"waypoint": {"address": d}} for d in destinations],
+        "travelMode": travel_mode,
+        "regionCode": "DE",
+    }
+    if travel_mode == "DRIVE":
+        body["routingPreference"] = "TRAFFIC_AWARE_OPTIMAL"
+    resp = requests.post(ROUTES_DM_URL, headers=headers, data=json.dumps(body), timeout=60)
+    if not resp.ok:
+        snippet = resp.text[:800].replace("\n", " ")
+        raise RuntimeError(f"Routes API HTTP {resp.status_code}. Body: {snippet}")
+    resp.raise_for_status()
+
+    return _parse_route_matrix_response(resp.text, origins, destinations)
+
+
+
+def gm_distance_matrix(api_key, origins, destinations, mode="walking"):
+    """Batcht Requests gegen Routes API, liefert dict[origin][destination] = distance_m (int|None)."""
+    result = {o: {} for o in origins}
+    for o_chunk in _chunk(origins, 25):
+        for d_chunk in _chunk(destinations, 25):
+            chunk_map = _gm_distance_matrix_chunk_routes(api_key, o_chunk, d_chunk, mode=mode)
+            # Merge
+            for o in o_chunk:
+                result[o].update(chunk_map.get(o, {}))
+    return result
+
+
+def gm_distance_matrix_with_status(api_key, origins, destinations, mode="walking"):
+    """Wie gm_distance_matrix, liefert zusätzlich Status-Infos je Paar.
+    Rückgabe: (dist_map, status_map)
+    dist_map[o][d] = int|None, status_map[o][d] = {code, message}
+    """
+    dist_result = {o: {} for o in origins}
+    status_result = {o: {} for o in origins}
+    for o_chunk in _chunk(origins, 25):
+        for d_chunk in _chunk(destinations, 25):
+            dist_chunk, status_chunk = _gm_distance_matrix_chunk_routes_with_status(api_key, o_chunk, d_chunk, mode=mode)
+            for o in o_chunk:
+                dist_result[o].update(dist_chunk.get(o, {}))
+                status_result[o].update(status_chunk.get(o, {}))
+    return dist_result, status_result
+
+
+
+def distances_to_center(api_key, addresses, center_address, mode="walking"):
+    dmap = gm_distance_matrix(api_key, addresses, [center_address], mode=mode)
+    return [dmap[a].get(center_address) for a in addresses]
+
+
+def distances_to_center_with_status(api_key, addresses, center_address, mode="walking"):
+    dist_map, status_map = gm_distance_matrix_with_status(api_key, addresses, [center_address], mode=mode)
+    dists = [dist_map[a].get(center_address) for a in addresses]
+    # status_map[a][center] ist bereits {code, message}
+    reason_map = {a: {center_address: status_map[a].get(center_address)} for a in addresses}
+    return dists, reason_map
 
 
 def build_itineraries(round_assignments, groups):
@@ -379,6 +548,9 @@ def main():
     # CSV laden
     df = read_csv_robust(args.csv_path, explicit_sep=args.sep)
 
+    if len(df) < 3:
+        raise ValueError("Zu wenige Gruppen in der CSV (mindestens 3 benötigt).")
+
     # Pflichtspalten prüfen (minimal)
     needed = [COL_FACHSCHAFT, COL_STREET, COL_PLZ, COL_STADT]
     for c in needed:
@@ -388,38 +560,54 @@ def main():
     # Normalisiere Fachschaft + Adresse bauen
     df["Fach_norm"] = df[COL_FACHSCHAFT].apply(normalize_fachschaft)
     df["Adresse"] = df.apply(build_full_address, axis=1)
-    df["Klingel"] = df[COL_KLINGEL].fillna("").apply(lambda s: s.strip() if isinstance(s, str) else "")
-    df["Name"] = (df[COL_NAME_1].fillna("").astype(str).str.strip()
-                  + " & "
-                  + df[COL_NAME_2].fillna("").astype(str).str.strip()).str.strip(" & ")
 
-    # Geokodierung via OSM/Nominatim (kein Google Maps)
-    osm_geocoder = None
-    if Nominatim is not None:
-        osm = Nominatim(user_agent="running_cocktail_mannheim")
-        osm_geocoder = RateLimiter(osm.geocode, min_delay_seconds=1, max_retries=2, swallow_exceptions=True)
+    # Optionalspalten robust behandeln
+    if COL_KLINGEL in df.columns:
+        df["Klingel"] = df[COL_KLINGEL].fillna("").astype(str).str.strip()
+    else:
+        df["Klingel"] = ""
 
-    lat_s, lon_s = geocode_center(osm_geocoder)
+    first = df[COL_NAME_1] if COL_NAME_1 in df.columns else pd.Series([""] * len(df))
+    second = df[COL_NAME_2] if COL_NAME_2 in df.columns else pd.Series([""] * len(df))
+    df["Name"] = (
+        first.fillna("").astype(str).str.strip()
+        + " & "
+        + second.fillna("").astype(str).str.strip()
+    ).str.strip(" & ")
 
-    lats, lons = [], []
-    for addr in df["Adresse"]:
-        lat, lon = geocode_one(addr, osm_geocoder)
-        lats.append(lat); lons.append(lon)
-    df["lat"] = lats
-    df["lon"] = lons
+    # Google Routes API Key
+    api_key = get_routes_api_key()
 
-    # Fallback: falls Geokodierung fehlgeschlagen, grobe Näherung ignorieren (Filter)
-    if df["lat"].isna().any():
-        # Minimal: fehlende Zeilen an Schloss kleben => Distanz 0 (damit sie inner landen)
-        df["lat"] = df["lat"].fillna(lat_s)
-        df["lon"] = df["lon"].fillna(lon_s)
+    # Distanzen zum Schloss (für Band-Einteilung) und Distanzmatrix mit Fehlerdiagnose
+    addresses = df["Adresse"].tolist()
+    try:
+        dist_center_list, status_map_center = distances_to_center_with_status(api_key, addresses, SCHLOSS_QUERY, mode="walking")
+        failed_rows = []
+        for a, d in zip(addresses, dist_center_list):
+            if d is None:
+                st = (status_map_center.get(a, {}).get(SCHLOSS_QUERY)) or {}
+                code = st.get("code", "UNKNOWN")
+                message = st.get("message", "")
+                failed_rows.append({"Adresse": a, "Grund_Code": code, "Grund_Message": message})
+        if failed_rows:
+            pd.DataFrame(failed_rows).to_csv(os.path.join(args.out_dir, "center_distance_failed.csv"), index=False)
+            print(f"[WARN] {len(failed_rows)} Adressen konnten nicht zum Schloss aufgelöst werden -> center_distance_failed.csv")
+        df["dist_m_schloss"] = [d if d is not None else 10**9 for d in dist_center_list]
 
-    # Distanz zum Schloss
-    df["dist_m_schloss"] = df.apply(lambda r: haversine_m(r["lat"], r["lon"], lat_s, lon_s), axis=1)
+        # 3 Bänder bestimmen (host_round = 1 außen, 2 mittel, 3 innen)
+        bands = split_into_three_bands_by_distance(df, "dist_m_schloss", args.seed)
+        if len(bands) != len(df):
+            raise RuntimeError("Interne Zuordnungslogik fehlgeschlagen: Nicht alle Gruppen wurden einem Host-Ring zugeteilt.")
+        df["host_round"] = df.index.map(bands)
 
-    # 3 Bänder bestimmen (host_round = 1 außen, 2 mittel, 3 innen)
-    bands = split_into_three_bands_by_distance(df, "dist_m_schloss", args.seed)
-    df["host_round"] = df.index.map(bands)
+        # Vollständige Adress-Distanzmatrix (Adresse->Adresse), für Wege zwischen Runden & Zuteilung
+        addr_dist_map = gm_distance_matrix(api_key, addresses, addresses + [SCHLOSS_QUERY], mode="walking")
+    except Exception as e:
+        print("\n[ERROR] Google Routes Distance Matrix fehlgeschlagen.")
+        print("       Häufige Ursachen: 'Routes API' nicht aktiviert, Billing fehlt, oder API-Key ist restriktiert (HTTP-Referrer/IP).")
+        print("       Bitte in Google Cloud Console prüfen: API 'Routes API' aktivieren, Billing aktiv, Key ohne App-Restriktion oder passende Server-IP freischalten.")
+        print(f"       Technische Fehlermeldung: {e}\n")
+        raise
 
     # Datenstruktur groups
     groups = {}
@@ -429,33 +617,41 @@ def main():
             "Name": row["Name"] if isinstance(row["Name"], str) and row["Name"].strip() else f"Gruppe {gid}",
             "Adresse": row["Adresse"],
             "Klingel": row["Klingel"] if row["Klingel"] else row["Name"],
-            "lat": float(row["lat"]),
-            "lon": float(row["lon"]),
             "dist": float(row["dist_m_schloss"]),
             "host_round": int(row["host_round"]),
         }
 
     # Runden: Host-Sets pro Runde
+    # Start-Standort jeder Gruppe: eigene Adresse
+    prev_locations = {gid: groups[gid]["Adresse"] for gid in groups}
+
     round_assignments = []
     encounters = defaultdict(set)     # group_id -> set(partner_ids)
-    fach_counts = defaultdict(Counter)
 
     all_ids = list(groups.keys())
     for r in [1, 2, 3]:
         hosts = [gid for gid in all_ids if groups[gid]["host_round"] == r]
         guests = [gid for gid in all_ids if groups[gid]["host_round"] != r]
 
-        # Sicherheit: genügend Gäste-Slots schaffen
-        assignments = schedule_round(hosts, guests, groups, r, rng, encounters, fach_counts)
+        assignments = schedule_round(hosts, guests, groups, r, rng, encounters, prev_locations, addr_dist_map, SCHLOSS_QUERY)
         round_assignments.append(assignments)
+
+        # Nach der Zuteilung die letzten Standorte aller Teilnehmer aktualisieren
+        # Hosts bleiben an ihrer Adresse; Gäste wechseln zum Host-Standort dieser Runde.
+        for pack in assignments:
+            h = pack["host"]
+            h_addr = groups[h]["Adresse"]
+            prev_locations[h] = h_addr
+            for g in pack["guests"]:
+                prev_locations[g] = h_addr
 
     # Itineraries bauen
     itineraries = build_itineraries(round_assignments, groups)
 
     # Exporte
-    # 1) Geokodierte Gruppen
+    # 1) Adressen + Distanz zum Schloss
     df_out = df.copy()
-    df_out.to_csv(os.path.join(args.out_dir, "geocoded_groups.csv"), index=False)
+    df_out.to_csv(os.path.join(args.out_dir, "addresses_with_center_distance.csv"), index=False)
 
     # 2) Rundenübersichten
     for i, packs in enumerate(round_assignments, start=1):
