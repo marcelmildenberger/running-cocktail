@@ -58,6 +58,11 @@ SCHLOSS_QUERY = "Mannheimer Schloss, 68161 Mannheim, Germany"
 # Standard: je Station 2 Gäste (Host + 2 Gäste = 3 Gruppen)
 DEFAULT_GUESTS_PER_HOST = 2
 
+# Reise-Distanz-Grenzen (Meter) zwischen zwei Runden
+TRAVEL_SOFT_LIMIT_M = 1200    # alles darunter gilt als unkritisch
+TRAVEL_HARD_LIMIT_M = 2600    # darüber nur wenn keine Alternative existiert
+TRAVEL_FAILOVER_PENALTY = 1e6
+
 
 # ----------------------------
 # Hilfsfunktionen
@@ -123,6 +128,41 @@ def build_full_address(row) -> str:
     return " ".join(addr.split())
 
 
+def compute_travel_penalty(distance_m):
+    """
+    Liefert eine Strafzahl für den Weg zwischen zwei Runden.
+    Kleinere Werte sind besser – sie werden vom Score subtrahiert.
+    """
+    if distance_m is None:
+        return TRAVEL_FAILOVER_PENALTY
+
+    km = distance_m / 1000.0
+    # Bis zur soften Grenze: moderate lineare Penalty
+    if distance_m <= TRAVEL_SOFT_LIMIT_M:
+        return km * 0.8
+
+    # Zwischen softem und hartem Limit: Penalty steigt deutlich stärker
+    over_soft = distance_m - TRAVEL_SOFT_LIMIT_M
+    penalty = (TRAVEL_SOFT_LIMIT_M / 1000.0) * 0.8
+    penalty += over_soft / 320.0  # ~3 Zusatzpunkte pro km oberhalb Soft-Limit
+
+    if distance_m >= TRAVEL_HARD_LIMIT_M:
+        over_hard = distance_m - TRAVEL_HARD_LIMIT_M
+        penalty += 8.0 + over_hard / 120.0  # hohe Strafe für sehr lange Wege
+
+    return penalty
+
+
+def is_faculty_mix_valid(host_id, guest_ids, groups):
+    """
+    Prüft, ob Host + Gäste nicht ausschließlich aus derselben Fachschaft bestehen,
+    sobald mindestens drei Gruppen beteiligt sind.
+    """
+    faculties = [groups[host_id]["Fach"]]
+    faculties.extend(groups[g]["Fach"] for g in guest_ids)
+    if len(faculties) < 3:
+        return True
+    return len(set(faculties)) > 1
 
 
 def split_into_three_bands_by_distance(df: pd.DataFrame, dist_col: str, seed: int):
@@ -169,6 +209,28 @@ def compute_host_capacities(num_hosts: int, num_available_guests: int, default_p
     return caps
 
 
+def collect_allergy_notes(group_ids, groups, exclude_ids=None):
+    """
+    Liefert eine formattierte Liste an Allergie-Hinweisen für die angegebenen Gruppen.
+    exclude_ids: optionale Iterable von Gruppen, die ignoriert werden sollen.
+    """
+    exclude = set(exclude_ids or [])
+    notes = []
+    for gid in group_ids:
+        if gid in exclude:
+            continue
+        text = (groups.get(gid, {}).get("Allergien") or "").strip()
+        if not text:
+            continue
+        notes.append(text)
+    # Doppelte Einträge entfernen, Reihenfolge beibehalten
+    seen = []
+    for note in notes:
+        if note not in seen:
+            seen.append(note)
+    return " | ".join(seen)
+
+
 def schedule_round(host_ids, guest_ids, groups, round_no, rng, encounters, prev_locations, addr_dist_map, center_addr):
     """
     Weist jedem Host eine Anzahl Gäste (1..3) zu, so dass:
@@ -190,20 +252,30 @@ def schedule_round(host_ids, guest_ids, groups, round_no, rng, encounters, prev_
     assignments = []  # Liste von dicts: {"host": h, "guests":[g1,g2,...]}
     guest_pool = set(guest_ids)
 
+    def has_repeat_encounter(h, g, co_guests):
+        """Return True if host or any already chosen guests met candidate before."""
+        if g in encounters[h]:
+            return True
+        for other in co_guests:
+            if g in encounters[other]:
+                return True
+        return False
+
     def pair_score(h, g, co_guests):
         # Höhere Punkte = besser
-        # Vermeide Wiederholungs-Begegnungen hart, minimiere Laufweg weich.
-        # Zusätzlich in Runde 3 leichte Bevorzugung von Hosts näher am Schloss.
+        # Vermeide Wiederholungs-Begegnungen hart, halte Fachschaften gemischt,
+        # bestrafe lange Laufwege und ziehe Runde-3-Hosts Richtung Schloss.
         score = 0.0
-        if g in encounters[h]:
-            return -1e6
+        if has_repeat_encounter(h, g, co_guests):
+            return float("-inf")
+
+        if not is_faculty_mix_valid(h, co_guests + [g], groups):
+            return float("-inf")
 
         prev_addr = prev_locations.get(g, groups[g]["Adresse"])
         host_addr = groups[h]["Adresse"]
         d = addr_dist_map.get(prev_addr, {}).get(host_addr)
-        if d is None:
-            d = 1e6
-        score -= d / 1000.0  # in km gewichten
+        score -= compute_travel_penalty(d)
 
         if round_no == 3:
             d_center = addr_dist_map.get(host_addr, {}).get(center_addr)
@@ -223,7 +295,7 @@ def schedule_round(host_ids, guest_ids, groups, round_no, rng, encounters, prev_
                 break
             # Kandidaten: alle noch freien Gäste
             best_g = None
-            best_s = -1e9
+            best_s = float("-inf")
             for g in guest_pool:
                 s = pair_score(host, g, chosen)
                 if s > best_s:
@@ -234,9 +306,9 @@ def schedule_round(host_ids, guest_ids, groups, round_no, rng, encounters, prev_
             chosen.append(best_g)
             guest_pool.remove(best_g)
 
-        if chosen:
-            assignments.append({"host": host, "guests": chosen})
+        assignments.append({"host": host, "guests": chosen})
 
+        if chosen:
             # Begegnungen registrieren (Host <-> Gäste und Gäste untereinander)
             for g in chosen:
                 encounters[host].add(g)
@@ -248,19 +320,28 @@ def schedule_round(host_ids, guest_ids, groups, round_no, rng, encounters, prev_
     # Falls aus irgendeinem Grund noch Gäste übrig sind (sollte nicht passieren, aber safety net):
     if guest_pool:
         # Hänge übrig gebliebene Gäste an Hosts mit der kleinsten Belegung
-        by_load = sorted(assignments, key=lambda x: len(x["guests"]))
         for g in list(guest_pool):
-            for pack in by_load:
+            placed = False
+            for pack in sorted(assignments, key=lambda x: len(x["guests"])):
+                h = pack["host"]
+                if has_repeat_encounter(h, g, pack["guests"]):
+                    continue
+                if not is_faculty_mix_valid(h, pack["guests"] + [g], groups):
+                    continue
                 pack["guests"].append(g)
                 guest_pool.remove(g)
+                placed = True
                 # Begegnungen nachtragen
-                h = pack["host"]
-                encounters[h].add(g); encounters[g].add(h)
+                encounters[h].add(g)
+                encounters[g].add(h)
                 for cg in pack["guests"]:
                     if cg == g:
                         continue
-                    encounters[cg].add(g); encounters[g].add(cg)
+                    encounters[cg].add(g)
+                    encounters[g].add(cg)
                 break
+            if not placed:
+                raise RuntimeError("Fachschafts-Mix konnte nicht eingehalten werden. Bitte mehr gemischte Gruppen anmelden oder manuell nachbessern.")
 
     return assignments
 
@@ -463,6 +544,7 @@ def build_itineraries(round_assignments, groups):
         for pack in packs:
             host = pack["host"]
             guests = pack["guests"]
+            host_allergy_notes = collect_allergy_notes(guests, groups)
             # Host-Eintrag
             itineraries[host].append({
                 "Runde": rnd_idx,
@@ -471,11 +553,13 @@ def build_itineraries(round_assignments, groups):
                 "Ort_Adresse": groups[host]["Adresse"],
                 "Ort_Bezug": "Eigene Location",
                 "Mit_Gruppen": [groups[g]["Name"] for g in guests],
-                "Mit_Fachschaften": [groups[g]["Fach"] for g in guests]
+                "Mit_Fachschaften": [groups[g]["Fach"] for g in guests],
+                "Allergie_Hinweise": host_allergy_notes,
             })
             # Gast-Einträge
             for g in guests:
                 others = [x for x in guests if x != g]
+                guest_allergy_notes = collect_allergy_notes([host] + others, groups, exclude_ids=[g])
                 itineraries[g].append({
                     "Runde": rnd_idx,
                     "Rolle": "GAST",
@@ -483,7 +567,8 @@ def build_itineraries(round_assignments, groups):
                     "Ort_Adresse": groups[host]["Adresse"],
                     "Ort_Bezug": f"Bei {groups[host]['Name']}",
                     "Mit_Gruppen": [groups[host]["Name"]] + [groups[o]["Name"] for o in others],
-                    "Mit_Fachschaften": [groups[host]["Fach"]] + [groups[o]["Fach"] for o in others]
+                    "Mit_Fachschaften": [groups[host]["Fach"]] + [groups[o]["Fach"] for o in others],
+                    "Allergie_Hinweise": guest_allergy_notes,
                 })
     # Nach Runde sortieren
     for gid in itineraries:
@@ -575,6 +660,11 @@ def main():
         + second.fillna("").astype(str).str.strip()
     ).str.strip(" & ")
 
+    if COL_ALLERGY in df.columns:
+        df["Allergien_norm"] = df[COL_ALLERGY].fillna("").astype(str).str.strip()
+    else:
+        df["Allergien_norm"] = ""
+
     # Google Routes API Key
     api_key = get_routes_api_key()
 
@@ -619,6 +709,7 @@ def main():
             "Klingel": row["Klingel"] if row["Klingel"] else row["Name"],
             "dist": float(row["dist_m_schloss"]),
             "host_round": int(row["host_round"]),
+            "Allergien": row.get("Allergien_norm", "").strip(),
         }
 
     # Runden: Host-Sets pro Runde
@@ -665,6 +756,7 @@ def main():
                 "Host_Adresse": groups[h]["Adresse"],
                 "Gast_Namen": " | ".join(groups[g]["Name"] for g in pack["guests"]),
                 "Gast_Fachschaften": " | ".join(groups[g]["Fach"] for g in pack["guests"]),
+                "Gast_Allergien": collect_allergy_notes(pack["guests"], groups),
             })
         pd.DataFrame(rows).to_csv(os.path.join(args.out_dir, f"round_{i}.csv"), index=False)
 
@@ -681,6 +773,7 @@ def main():
                 "Ort_Adresse": ent["Ort_Adresse"],
                 "Mit_Gruppen": " | ".join(ent["Mit_Gruppen"]),
                 "Mit_Fachschaften": " | ".join(ent["Mit_Fachschaften"]),
+                "Allergie_Hinweise": ent.get("Allergie_Hinweise", ""),
             })
     df_it = pd.DataFrame(rows).sort_values(["Gruppe", "Runde"])
     df_it.to_csv(os.path.join(args.out_dir, "itineraries_per_group.csv"), index=False)
