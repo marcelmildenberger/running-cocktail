@@ -5,7 +5,9 @@ Planer für 'Running Cocktail' Mannheim
 
 Funktionen:
 - CSV einlesen (deutsche Spaltennamen)
-- Entfernungen via Google Maps Distance Matrix (kein Geocoding, nur Adressen)
+- Entfernungen via OpenStreetMap-Dienste:
+    * Nominatim (Geocoding) — kostenlos, bitte eigenen User-Agent/Email setzen
+    * OSRM Table API (Distanzmatrix)
 - Gruppen in 3 Ringe (außen/mittel/innen) einteilen
 - 3 Runden mit Stations-Trios (Host + 2 Gäste) planen:
     * jede Gruppe hostet genau 1x
@@ -15,22 +17,20 @@ Funktionen:
 - Itineraries & Runden-Übersichten exportieren (CSV/Excel)
 
 Aufruf:
-    python main.py RuCo.csv resultcle
+    python main.py RuCo.csv result
 
-Benötigte Pakete: pandas, numpy, requests, (optional) openpyxl
+Benötigte Pakete: pandas, requests, (optional) openpyxl
 """
 
 import os
-import sys
 import random
 import argparse
 import itertools
+import time
 from collections import defaultdict
 
 import pandas as pd
-import numpy as np
 import requests
-import json
 import re
 
 
@@ -53,7 +53,7 @@ COL_STADTTEIL = "neighbourhood"
 COL_STADT = "city"
 
 # Schloss Mannheim – wird (best effort) geokodiert; falls offline: Fallback-Koordinaten
-SCHLOSS_QUERY = "Mannheimer Schloss, 68161 Mannheim, Germany"
+SCHLOSS_QUERY = "Parkring 39"
 
 # Standard: je Station 2 Gäste (Host + 2 Gäste = 3 Gruppen)
 DEFAULT_GUESTS_PER_HOST = 2
@@ -76,14 +76,18 @@ def normalize_fachschaft(s: str) -> str:
         return "VWL"
     if "fim" in s_low:
         return "FIM"
+    if "split" in s_low:
+        return "SPLIT"
+    if "mkw" in s_low:
+        return "MKW"
     # Fallback: erstes Wort groß
     return s.strip().upper()
 
 
 def build_full_address(row) -> str:
-    """Baut eine Adresse für Google Routes: "Straße Hausnr, PLZ Stadt, Germany".
+    """Baut eine Adresse für Geocoding/OSRM: "Straße Hausnr, PLZ Stadt, Germany".
     Wichtige Regeln:
-      - **neighbourhood wird NICHT eingefügt** (führt häufig zu NO_ELEMENT bei RouteMatrix)
+      - **neighbourhood wird NICHT eingefügt** (führt häufig zu Fehlertreffern)
       - Mannheimer Quadrate wie "F4, 16" / "F 4, 16" -> "F4 16"
       - Falls im Straßenfeld Kommas vorkommen (z.B. "Steubenstraße 80, 304"), wird nur der **erste** Teil verwendet
       - ß -> ss als Fallback
@@ -347,188 +351,180 @@ def schedule_round(host_ids, guest_ids, groups, round_no, rng, encounters, prev_
 
 
 
-# --- Google Routes API helper ---
-
-def get_routes_api_key():
-    """
-    Bezieht den API-Key bevorzugt aus der Umgebung (GOOGLE_MAPS_API_KEY oder GOOGLE_ROUTES_API_KEY).
-    Fällt – nur falls vorhanden – auf den im Code hinterlegten Key zurück.
-    """
-    for var_name in ("GOOGLE_ROUTES_API_KEY", "GOOGLE_MAPS_API_KEY", "GOOGLE_MAPS_DISTANCE_MATRIX_API_KEY"):
-        candidate = os.environ.get(var_name)
-        if candidate and candidate.strip():
-            return candidate.strip()
-
-    # Historischer Fallback-Key (z.B. für lokale Tests). Bitte durch eigenen Key ersetzen.
-    fallback_key = ""
-    if fallback_key:
-        return fallback_key
-
-    raise RuntimeError("Kein Google Routes API Key gefunden. Setze z.B. GOOGLE_ROUTES_API_KEY in deiner Umgebung.")
-
-
+# --- OpenStreetMap helpers (Nominatim + OSRM) ---
 
 def _chunk(lst, n):
     for i in range(0, len(lst), n):
         yield lst[i:i+n]
 
-ROUTES_DM_URL = "https://routes.googleapis.com/distanceMatrix/v2:computeRouteMatrix"
 
-_MODE_MAP = {
-    "walking": "WALK",
-    "driving": "DRIVE",
-    "bicycling": "BICYCLE",
-    "bicycle": "BICYCLE",
-    "transit": "TRANSIT",
+NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
+OSRM_BASE_URL = "https://router.project-osrm.org"
+OSRM_MAX_LOCATIONS_PER_REQUEST = 50  # max. Quellen/Ziele pro Request, damit wir <100 Koordinaten bleiben
+try:
+    NOMINATIM_REQUEST_DELAY = float(os.environ.get("NOMINATIM_REQUEST_DELAY", "1.0"))
+except ValueError:
+    NOMINATIM_REQUEST_DELAY = 1.0
+
+OSRM_MODE_MAP = {
+    "walking": "walking",
+    "walk": "walking",
+    "foot": "walking",
+    "driving": "driving",
+    "car": "driving",
+    "bicycling": "cycling",
+    "bicycle": "cycling",
+    "bike": "cycling",
+    "transit": "walking",  # Transit gibt es nicht -> laufen als best-effort
 }
 
-def _parse_route_matrix_response(text, origins, destinations):
-    """Parst die JSON-Lines Antwort der Routes API und liefert zwei Maps:
-    - dist_out[origin][destination] = distanceMeters | None
-    - status_out[origin][destination] = {"code": int|str, "message": str}
-      Für fehlende Elemente wird ein Dummy-Status gesetzt.
+
+def _nominatim_headers():
+    email = os.environ.get("NOMINATIM_EMAIL", "").strip()
+    ua = os.environ.get("NOMINATIM_USER_AGENT", "").strip()
+    if not ua:
+        contact_hint = email or "set NOMINATIM_EMAIL"
+        ua = f"running-cocktail-scheduler/1.0 ({contact_hint})"
+    headers = {"User-Agent": ua}
+    if email:
+        headers["From"] = email
+    return headers
+
+
+def geocode_address(address: str, session=None):
+    """Geokodiert eine Adresse via Nominatim, liefert (lat, lon) oder None."""
+    session = session or requests.Session()
+    params = {
+        "q": address,
+        "format": "jsonv2",
+        "limit": 1,
+        "countrycodes": "de",
+        "addressdetails": 0,
+    }
+    resp = session.get(NOMINATIM_URL, params=params, headers=_nominatim_headers(), timeout=30)
+    if resp.status_code == 429:
+        raise RuntimeError("Nominatim Rate-Limit (HTTP 429). Bitte kurz warten oder die Pausenzeit erhöhen.")
+    resp.raise_for_status()
+    data = resp.json()
+    if not data:
+        return None
+    try:
+        lat = float(data[0]["lat"])
+        lon = float(data[0]["lon"])
+        return (lat, lon)
+    except (KeyError, ValueError, TypeError):
+        return None
+
+
+def geocode_addresses(addresses, pause_seconds=NOMINATIM_REQUEST_DELAY):
     """
-    def _collect_entries(obj, bucket):
-        if isinstance(obj, dict):
-            if "originIndex" in obj and "destinationIndex" in obj:
-                bucket.append(obj)
-            else:
-                for val in obj.values():
-                    _collect_entries(val, bucket)
-        elif isinstance(obj, list):
-            for item in obj:
-                _collect_entries(item, bucket)
-
-    raw = (text or "")
-    elements = []
-    for line in raw.strip().splitlines():
-        stripped = line.strip()
-        if not stripped:
+    Geokodiert eine Liste von Adressen seriell (Nominatim bitte nicht flooden).
+    Gibt (coords_map, failures) zurück:
+      coords_map[address] = (lat, lon)
+      failures[address] = Grund (String)
+    """
+    session = requests.Session()
+    coords = {}
+    failures = {}
+    seen = set()
+    unique_addrs = []
+    for addr in addresses:
+        if addr in seen:
             continue
-        if stripped.startswith("data:"):
-            stripped = stripped[5:].strip()
+        seen.add(addr)
+        unique_addrs.append(addr)
+
+    for idx, addr in enumerate(unique_addrs):
         try:
-            candidate = json.loads(stripped)
-        except Exception:
-            continue
-        _collect_entries(candidate, elements)
-
-    if not elements:
-        # Fallback: einige Responses kommen als JSON-Objekt statt JSON-Lines
-        try:
-            payload = json.loads(raw)
-        except Exception:
-            payload = None
-        if payload is not None:
-            _collect_entries(payload, elements)
-
-    result = {}
-    status_map_idx = {}
-    for el in elements:
-        if not isinstance(el, dict):
-            continue
-        oi = el.get("originIndex")
-        di = el.get("destinationIndex")
-        if oi is None or di is None:
-            continue
-        status_obj = el.get("status") or {}
-        status_code = status_obj.get("code", 0)
-        status_map_idx.setdefault(oi, {})[di] = {
-            "code": status_code,
-            "message": status_obj.get("message", "")
-        }
-        dist = el.get("distanceMeters") if status_code == 0 else None
-        result.setdefault(oi, {})[di] = dist
-
-    # In adressbasierte Maps umwandeln
-    dist_out = {o: {} for o in origins}
-    status_out = {o: {} for o in origins}
-    for oi in range(len(origins)):
-        for di in range(len(destinations)):
-            dist = None
-            status_obj = status_map_idx.get(oi, {}).get(di)
-            if status_obj is None:
-                # Element fehlte komplett in der Antwort
-                status_obj = {"code": "NO_ELEMENT", "message": "Pair missing in response"}
+            res = geocode_address(addr, session=session)
+            if res is None:
+                failures[addr] = "NOT_FOUND"
             else:
-                dist = result.get(oi, {}).get(di)
-            dist_out[origins[oi]][destinations[di]] = dist
-            status_out[origins[oi]][destinations[di]] = status_obj
-    return dist_out, status_out
+                coords[addr] = res
+        except Exception as e:
+            failures[addr] = str(e)
+        if pause_seconds and idx + 1 < len(unique_addrs):
+            time.sleep(pause_seconds)
+
+    return coords, failures
 
 
-def _gm_distance_matrix_chunk_routes(api_key, origins, destinations, mode="walking"):
-    out, _status = _gm_distance_matrix_chunk_routes_with_status(api_key, origins, destinations, mode=mode)
+def _osrm_table_chunk(origins, destinations, coords_map, profile="walking"):
+    """
+    Holt eine Distanzmatrix (Meter) für einen kleinen Chunk via OSRM Table API.
+    coords_map[address] = (lat, lon)
+    """
+    out = {o: {d: None for d in destinations} for o in origins}
+
+    coord_list = []
+    coord_indices = {}
+    for addr in origins + destinations:
+        if addr in coord_indices:
+            continue
+        coord = coords_map.get(addr)
+        if coord is None:
+            coord_indices[addr] = None
+            continue
+        lat, lon = coord
+        coord_indices[addr] = len(coord_list)
+        coord_list.append((lon, lat))  # OSRM erwartet lon,lat
+
+    source_addrs = [o for o in origins if coord_indices.get(o) is not None]
+    dest_addrs = [d for d in destinations if coord_indices.get(d) is not None]
+    if not source_addrs or not dest_addrs:
+        return out
+
+    coord_str = ";".join(f"{lon},{lat}" for lon, lat in coord_list)
+    params = {
+        "sources": ";".join(str(coord_indices[o]) for o in source_addrs),
+        "destinations": ";".join(str(coord_indices[d]) for d in dest_addrs),
+        "annotations": "distance",
+    }
+    url = f"{OSRM_BASE_URL}/table/v1/{profile}/{coord_str}"
+    resp = requests.get(url, params=params, timeout=30)
+    resp.raise_for_status()
+    data = resp.json()
+    if data.get("code") != "Ok":
+        raise RuntimeError(f"OSRM Table API Error: {data.get('message', 'unknown')}")
+    distances = data.get("distances")
+    if not distances:
+        return out
+
+    for row_idx, o in enumerate(source_addrs):
+        row = distances[row_idx]
+        if row is None:
+            continue
+        for col_idx, d in enumerate(dest_addrs):
+            val = row[col_idx]
+            if val is None:
+                continue
+            try:
+                out[o][d] = int(round(float(val)))
+            except Exception:
+                out[o][d] = None
     return out
 
 
-def _gm_distance_matrix_chunk_routes_with_status(api_key, origins, destinations, mode="walking"):
-    travel_mode = _MODE_MAP.get((mode or "walking").lower(), "WALK")
-    headers = {
-        "Content-Type": "application/json",
-        "Accept": "application/json",
-        "X-Goog-Api-Key": api_key,
-        # FieldMask ist Pflicht, sonst 400
-        "X-Goog-FieldMask": "originIndex,destinationIndex,distanceMeters,duration,status",
-    }
-    body = {
-        "origins": [{"waypoint": {"address": o}} for o in origins],
-        "destinations": [{"waypoint": {"address": d}} for d in destinations],
-        "travelMode": travel_mode,
-        "regionCode": "DE",
-    }
-    if travel_mode == "DRIVE":
-        body["routingPreference"] = "TRAFFIC_AWARE_OPTIMAL"
-    resp = requests.post(ROUTES_DM_URL, headers=headers, data=json.dumps(body), timeout=60)
-    if not resp.ok:
-        snippet = resp.text[:800].replace("\n", " ")
-        raise RuntimeError(f"Routes API HTTP {resp.status_code}. Body: {snippet}")
-    resp.raise_for_status()
-
-    return _parse_route_matrix_response(resp.text, origins, destinations)
-
-
-
-def gm_distance_matrix(api_key, origins, destinations, mode="walking"):
-    """Batcht Requests gegen Routes API, liefert dict[origin][destination] = distance_m (int|None)."""
+def osrm_distance_matrix(origins, destinations, coords_map, mode="walking", max_locations=OSRM_MAX_LOCATIONS_PER_REQUEST):
+    """
+    Batcht Requests gegen die OSRM Table API.
+    Rückgabe: dict[origin][destination] = distance_m (int|None)
+    """
+    profile = OSRM_MODE_MAP.get((mode or "walking").lower(), "walking")
     result = {o: {} for o in origins}
-    for o_chunk in _chunk(origins, 25):
-        for d_chunk in _chunk(destinations, 25):
-            chunk_map = _gm_distance_matrix_chunk_routes(api_key, o_chunk, d_chunk, mode=mode)
-            # Merge
+    origin_list = list(origins)
+    dest_list = list(destinations)
+    for o_chunk in _chunk(origin_list, max_locations):
+        for d_chunk in _chunk(dest_list, max_locations):
+            chunk_map = _osrm_table_chunk(o_chunk, d_chunk, coords_map, profile=profile)
             for o in o_chunk:
                 result[o].update(chunk_map.get(o, {}))
     return result
 
 
-def gm_distance_matrix_with_status(api_key, origins, destinations, mode="walking"):
-    """Wie gm_distance_matrix, liefert zusätzlich Status-Infos je Paar.
-    Rückgabe: (dist_map, status_map)
-    dist_map[o][d] = int|None, status_map[o][d] = {code, message}
-    """
-    dist_result = {o: {} for o in origins}
-    status_result = {o: {} for o in origins}
-    for o_chunk in _chunk(origins, 25):
-        for d_chunk in _chunk(destinations, 25):
-            dist_chunk, status_chunk = _gm_distance_matrix_chunk_routes_with_status(api_key, o_chunk, d_chunk, mode=mode)
-            for o in o_chunk:
-                dist_result[o].update(dist_chunk.get(o, {}))
-                status_result[o].update(status_chunk.get(o, {}))
-    return dist_result, status_result
-
-
-
-def distances_to_center(api_key, addresses, center_address, mode="walking"):
-    dmap = gm_distance_matrix(api_key, addresses, [center_address], mode=mode)
+def distances_to_center(addresses, center_address, coords_map, mode="walking"):
+    dmap = osrm_distance_matrix(addresses, [center_address], coords_map, mode=mode)
     return [dmap[a].get(center_address) for a in addresses]
-
-
-def distances_to_center_with_status(api_key, addresses, center_address, mode="walking"):
-    dist_map, status_map = gm_distance_matrix_with_status(api_key, addresses, [center_address], mode=mode)
-    dists = [dist_map[a].get(center_address) for a in addresses]
-    # status_map[a][center] ist bereits {code, message}
-    reason_map = {a: {center_address: status_map[a].get(center_address)} for a in addresses}
-    return dists, reason_map
 
 
 def build_itineraries(round_assignments, groups):
@@ -665,39 +661,45 @@ def main():
     else:
         df["Allergien_norm"] = ""
 
-    # Google Routes API Key
-    api_key = get_routes_api_key()
-
-    # Distanzen zum Schloss (für Band-Einteilung) und Distanzmatrix mit Fehlerdiagnose
+    # Geocoding + Distanzmatrix
     addresses = df["Adresse"].tolist()
+    all_addresses_for_geocoding = addresses + [SCHLOSS_QUERY]
+    coords_map, geocode_failures = geocode_addresses(all_addresses_for_geocoding)
+
+    if geocode_failures:
+        rows = [{"Adresse": addr, "Grund_Code": "GEOCODE_FAILED", "Grund_Message": reason} for addr, reason in geocode_failures.items()]
+        pd.DataFrame(rows).to_csv(os.path.join(args.out_dir, "geocoding_failed.csv"), index=False)
+        print(f"[WARN] {len(geocode_failures)} Adressen konnten nicht geokodiert werden -> geocoding_failed.csv")
+
+    if SCHLOSS_QUERY not in coords_map:
+        raise RuntimeError("Schloss-Adresse konnte nicht geokodiert werden. Bitte Adresse prüfen oder später erneut versuchen (Nominatim Rate-Limit?).")
+
+    # Distanzen zum Schloss (für Band-Einteilung) und Distanzmatrix
     try:
-        dist_center_list, status_map_center = distances_to_center_with_status(api_key, addresses, SCHLOSS_QUERY, mode="walking")
-        failed_rows = []
-        for a, d in zip(addresses, dist_center_list):
-            if d is None:
-                st = (status_map_center.get(a, {}).get(SCHLOSS_QUERY)) or {}
-                code = st.get("code", "UNKNOWN")
-                message = st.get("message", "")
-                failed_rows.append({"Adresse": a, "Grund_Code": code, "Grund_Message": message})
-        if failed_rows:
-            pd.DataFrame(failed_rows).to_csv(os.path.join(args.out_dir, "center_distance_failed.csv"), index=False)
-            print(f"[WARN] {len(failed_rows)} Adressen konnten nicht zum Schloss aufgelöst werden -> center_distance_failed.csv")
-        df["dist_m_schloss"] = [d if d is not None else 10**9 for d in dist_center_list]
-
-        # 3 Bänder bestimmen (host_round = 1 außen, 2 mittel, 3 innen)
-        bands = split_into_three_bands_by_distance(df, "dist_m_schloss", args.seed)
-        if len(bands) != len(df):
-            raise RuntimeError("Interne Zuordnungslogik fehlgeschlagen: Nicht alle Gruppen wurden einem Host-Ring zugeteilt.")
-        df["host_round"] = df.index.map(bands)
-
-        # Vollständige Adress-Distanzmatrix (Adresse->Adresse), für Wege zwischen Runden & Zuteilung
-        addr_dist_map = gm_distance_matrix(api_key, addresses, addresses + [SCHLOSS_QUERY], mode="walking")
+        addr_dist_map = osrm_distance_matrix(addresses, addresses + [SCHLOSS_QUERY], coords_map, mode="walking")
     except Exception as e:
-        print("\n[ERROR] Google Routes Distance Matrix fehlgeschlagen.")
-        print("       Häufige Ursachen: 'Routes API' nicht aktiviert, Billing fehlt, oder API-Key ist restriktiert (HTTP-Referrer/IP).")
-        print("       Bitte in Google Cloud Console prüfen: API 'Routes API' aktivieren, Billing aktiv, Key ohne App-Restriktion oder passende Server-IP freischalten.")
+        print("\n[ERROR] Distanzmatrix via OSRM fehlgeschlagen.")
+        print("       Prüfe Internetverbindung oder versuche es später erneut (öffentlicher OSRM-Server).")
         print(f"       Technische Fehlermeldung: {e}\n")
         raise
+
+    dist_center_list = [addr_dist_map.get(a, {}).get(SCHLOSS_QUERY) for a in addresses]
+    failed_rows = []
+    for a, d in zip(addresses, dist_center_list):
+        if a not in coords_map:
+            failed_rows.append({"Adresse": a, "Grund_Code": "GEOCODE_FAILED", "Grund_Message": geocode_failures.get(a, "Nominatim lieferte keine Koordinate")})
+        elif d is None:
+            failed_rows.append({"Adresse": a, "Grund_Code": "NO_ROUTE", "Grund_Message": "OSRM lieferte keine Distanz"})
+    if failed_rows:
+        pd.DataFrame(failed_rows).to_csv(os.path.join(args.out_dir, "center_distance_failed.csv"), index=False)
+        print(f"[WARN] {len(failed_rows)} Adressen konnten nicht zum Schloss aufgelöst werden -> center_distance_failed.csv")
+    df["dist_m_schloss"] = [d if d is not None else 10**9 for d in dist_center_list]
+
+    # 3 Bänder bestimmen (host_round = 1 außen, 2 mittel, 3 innen)
+    bands = split_into_three_bands_by_distance(df, "dist_m_schloss", args.seed)
+    if len(bands) != len(df):
+        raise RuntimeError("Interne Zuordnungslogik fehlgeschlagen: Nicht alle Gruppen wurden einem Host-Ring zugeteilt.")
+    df["host_round"] = df.index.map(bands)
 
     # Datenstruktur groups
     groups = {}
